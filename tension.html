@@ -1,0 +1,614 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#0a0e17">
+<title>Tension</title>
+<style>
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body {
+    margin: 0; padding: 0; width: 100%; height: 100%;
+    overflow: hidden; background: #0a0e17;
+  }
+  body {
+    position: fixed; inset: 0;
+    touch-action: none; overscroll-behavior: none;
+    user-select: none; -webkit-user-select: none;
+  }
+  #c { position: fixed; inset: 0; display: block; touch-action: none; }
+  #hud {
+    position: fixed; top: 0; left: 0; right: 0; z-index: 10;
+    display: flex; align-items: center; gap: 18px;
+    padding: calc(env(safe-area-inset-top, 0px) + 14px) 16px 10px;
+    font: 600 12px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    letter-spacing: .18em; color: #8fd6e6;
+    pointer-events: none; user-select: none; -webkit-user-select: none;
+  }
+  #hud span { white-space: nowrap; }
+  #moves { color: #55788c; }
+  #restart {
+    margin-left: auto; pointer-events: auto;
+    width: 40px; height: 40px; padding: 0;
+    display: flex; align-items: center; justify-content: center;
+    background: rgba(120, 220, 255, .06);
+    border: 1px solid rgba(120, 220, 255, .22);
+    border-radius: 11px; color: #8fd6e6; cursor: pointer;
+  }
+  #restart:active { background: rgba(120, 220, 255, .18); }
+</style>
+</head>
+<body>
+<div id="hud">
+  <span id="level">LEVEL 1</span>
+  <span id="moves">MOVES 0</span>
+  <button id="restart" type="button" aria-label="Restart level" title="Restart level">
+    <svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor"
+         stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M23 4v6h-6"></path>
+      <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"></path>
+    </svg>
+  </button>
+</div>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  /* ============================================================
+     Tension — planar graph untangling.
+     Zero dependencies: vanilla JS + Canvas 2D + Web Audio.
+     ============================================================ */
+
+  var cv = document.getElementById('c');
+  var ctx = cv.getContext('2d', { alpha: false });
+  var levelEl = document.getElementById('level');
+  var movesEl = document.getElementById('moves');
+  var restartEl = document.getElementById('restart');
+
+  var TAU = Math.PI * 2;
+  var SWAP_MS = 150;      // elastic swap animation
+  var WIN_MS = 200;       // flash + collapse duration
+  var MAX_NODES = 12;     // socket count cap
+
+  // line palettes: [glow, mid, core]
+  var HOT = [
+    { c: '#ff1f4b', a: 0.22, w: 4.2 },
+    { c: '#ff5a1f', a: 0.70, w: 2.2 },
+    { c: '#ffd9c2', a: 0.95, w: 1.1 }
+  ];
+  var CALM = [
+    { c: '#00c2ff', a: 0.20, w: 3.8 },
+    { c: '#59e6ff', a: 0.62, w: 2.0 },
+    { c: '#eaffff', a: 0.92, w: 1.0 }
+  ];
+
+  var W = 0, H = 0, DPR = 1;
+  var CX = 0, CY = 0, R = 0, NR = 12, bgGrad = null;
+
+  var sockets = [];      // fixed geometric sockets around the circle
+  var nodes = [];        // { id, socket, x, y, anim, hot }
+  var edges = [];        // { a, b, cross }
+  var initial = [];      // socket assignment of the scrambled start
+
+  var level = 1, moves = 0, selected = -1;
+  var state = 'play';    // 'play' | 'win'
+  var winStart = 0, crossings = 0, anyAnim = false;
+  var tangled = false;   // has this level ever shown a crossing? (blocks instant auto-win)
+  var px = [], py = [];  // per-frame position scratch buffers
+
+  /* ---------------- layout ---------------- */
+
+  function computeLayout() {
+    var n = Math.max(1, nodes.length);
+    CX = W / 2;
+    CY = H * 0.55;
+    R = Math.min(W * 0.37, H * 0.34);
+    NR = Math.max(9, Math.min(16, R * 0.11));
+    sockets = [];
+    for (var i = 0; i < n; i++) {
+      var a = -Math.PI / 2 + (i / n) * TAU;
+      sockets.push({ x: CX + Math.cos(a) * R, y: CY + Math.sin(a) * R });
+    }
+    bgGrad = ctx.createRadialGradient(CX, CY, R * 0.3, CX, CY, Math.max(W, H) * 0.9);
+    bgGrad.addColorStop(0, '#111c30');
+    bgGrad.addColorStop(1, '#0a0e17');
+  }
+
+  function applyPositions() {
+    for (var i = 0; i < nodes.length; i++) {
+      var n = nodes[i];
+      if (!n.anim) { n.x = sockets[n.socket].x; n.y = sockets[n.socket].y; }
+    }
+  }
+
+  function resize() {
+    W = window.innerWidth;
+    H = window.innerHeight;
+    DPR = Math.min(window.devicePixelRatio || 1, 2);
+    cv.width = Math.max(1, Math.round(W * DPR));
+    cv.height = Math.max(1, Math.round(H * DPR));
+    cv.style.width = W + 'px';
+    cv.style.height = H + 'px';
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    for (var i = 0; i < nodes.length; i++) nodes[i].anim = null;
+    computeLayout();
+    applyPositions();
+  }
+
+  /* ---------------- geometry ---------------- */
+
+  // proper (strict) segment intersection; collinear/touching never counts
+  function segCross(ax, ay, bx, by, cx, cy, dx, dy) {
+    var d1 = (dx - cx) * (ay - cy) - (dy - cy) * (ax - cx);
+    var d2 = (dx - cx) * (by - cy) - (dy - cy) * (bx - cx);
+    var d3 = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
+    var d4 = (bx - ax) * (dy - ay) - (by - ay) * (dx - ax);
+    return ((d1 > 0 && d2 < 0) || (d1 < 0 && d2 > 0)) &&
+           ((d3 > 0 && d4 < 0) || (d3 < 0 && d4 > 0));
+  }
+
+  // is x strictly inside the forward arc s -> e on the socket circle
+  function inArc(x, s, e) {
+    return s < e ? (x > s && x < e) : (x > s || x < e);
+  }
+
+  // do two chords (a,b) and (c,d) of the reference polygon cross?
+  function chordsCross(a, b, c, d) {
+    if (inArc(c, a, b) === inArc(d, a, b)) return false;
+    return inArc(a, c, d) !== inArc(b, c, d);
+  }
+
+  function countCrossings(ax, ay) {
+    var c = 0;
+    for (var i = 0; i < edges.length; i++) {
+      for (var j = i + 1; j < edges.length; j++) {
+        var e1 = edges[i], e2 = edges[j];
+        if (e1.a === e2.a || e1.a === e2.b || e1.b === e2.a || e1.b === e2.b) continue;
+        if (segCross(ax[e1.a], ay[e1.a], ax[e1.b], ay[e1.b],
+                     ax[e2.a], ay[e2.a], ax[e2.b], ay[e2.b])) {
+          e1.cross = true;
+          e2.cross = true;
+          c++;
+        }
+      }
+    }
+    return c;
+  }
+
+  function updateCrossings() {
+    px.length = 0; py.length = 0;
+    for (var i = 0; i < nodes.length; i++) { px.push(nodes[i].x); py.push(nodes[i].y); }
+    for (var i = 0; i < edges.length; i++) edges[i].cross = false;
+    for (var i = 0; i < nodes.length; i++) nodes[i].hot = false;
+    crossings = countCrossings(px, py);
+    for (var i = 0; i < edges.length; i++) {
+      if (edges[i].cross) {
+        nodes[edges[i].a].hot = true;
+        nodes[edges[i].b].hot = true;
+      }
+    }
+  }
+
+  /* ---------------- level generation ----------------
+     The graph is built in socket space so the identity embedding
+     is guaranteed crossing-free (outerplanar: cycle + non-crossing
+     chords), then nodes are shuffled over the sockets. */
+
+  function buildEdges(N, chordGoal) {
+    var list = [], seen = {};
+    function key(a, b) { return a < b ? a + ':' + b : b + ':' + a; }
+    for (var i = 0; i < N; i++) {
+      var a = i, b = (i + 1) % N;
+      list.push([a, b]);
+      seen[key(a, b)] = 1;
+    }
+    var added = 0, tries = 0;
+    while (added < chordGoal && tries < 600) {
+      tries++;
+      var a2 = (Math.random() * N) | 0;
+      var b2 = (Math.random() * N) | 0;
+      if (a2 === b2) continue;
+      if (a2 > b2) { var t = a2; a2 = b2; b2 = t; }
+      if (b2 === a2 + 1 || (a2 === 0 && b2 === N - 1)) continue; // already a cycle edge
+      var k = key(a2, b2);
+      if (seen[k]) continue;
+      var crossed = false;
+      for (var j = 0; j < list.length; j++) {
+        if (chordsCross(a2, b2, list[j][0], list[j][1])) { crossed = true; break; }
+      }
+      if (crossed) continue;
+      seen[k] = 1;
+      list.push([a2, b2]);
+      added++;
+    }
+    return list;
+  }
+
+  function scorePerm(perm) {
+    var sx = [], sy = [];
+    for (var i = 0; i < perm.length; i++) {
+      sx.push(sockets[perm[i]].x);
+      sy.push(sockets[perm[i]].y);
+    }
+    return countCrossings(sx, sy);
+  }
+
+  function scramble(N) {
+    var best = null, bestScore = -1;
+    for (var t = 0; t < 120; t++) {
+      var perm = [];
+      for (var i = 0; i < N; i++) perm.push(i);
+      for (var i = N - 1; i > 0; i--) {
+        var j = (Math.random() * (i + 1)) | 0;
+        var tmp = perm[i]; perm[i] = perm[j]; perm[j] = tmp;
+      }
+      var s = scorePerm(perm);
+      if (s > bestScore) { bestScore = s; best = perm; }
+      if (bestScore >= Math.max(3, N)) break;
+    }
+    return best;
+  }
+
+  function buildLevel(lv) {
+    level = lv;
+    moves = 0;
+    selected = -1;
+    state = 'play';
+    tangled = false;
+
+    var N = Math.min(lv + 3, MAX_NODES);          // +1 node per level (until cap)
+    var chords = Math.min(lv - 1, N - 3);         // extra edge complexity per level
+
+    nodes = [];
+    for (var i = 0; i < N; i++) {
+      nodes.push({ id: i, socket: i, x: 0, y: 0, anim: null, hot: false });
+    }
+    computeLayout();
+
+    var list = buildEdges(N, chords);
+    edges = [];
+    for (var i = 0; i < list.length; i++) {
+      edges.push({ a: list[i][0], b: list[i][1], cross: false });
+    }
+
+    var perm = scramble(N);
+    var retries = 10; // never start a level already "solved"
+    while (scorePerm(perm) === 0 && retries-- > 0) perm = scramble(N);
+    for (var i = 0; i < N; i++) nodes[i].socket = perm[i];
+    initial = perm.slice();
+
+    applyPositions();
+    updateCrossings();
+    updateHUD();
+  }
+
+  function restart() {
+    if (state === 'win') return;
+    selected = -1;
+    for (var i = 0; i < nodes.length; i++) {
+      nodes[i].anim = null;
+      nodes[i].socket = initial[i];
+    }
+    applyPositions();
+    updateCrossings();
+    moves = 0;
+    updateHUD();
+  }
+
+  /* ---------------- audio (Karplus-Strong pluck) ---------------- */
+
+  var ac = null;
+
+  function ensureAudio() {
+    try {
+      if (!ac) {
+        var AC = window.AudioContext || window.webkitAudioContext;
+        if (AC) ac = new AC();
+      }
+      if (ac && ac.state === 'suspended') {
+        var p = ac.resume();
+        if (p && p.catch) p.catch(function () {});
+      }
+    } catch (e) {}
+  }
+
+  function playPluck() {
+    try {
+      ensureAudio();
+      if (!ac) return;
+      var sr = ac.sampleRate;
+      var n = Math.floor(sr * 1.1);
+      var buf = ac.createBuffer(1, n, sr);
+      var d = buf.getChannelData(0);
+
+      var semis = [0, 3, 5, 7, 10, 12, 15, 17, 19, 22, 24];
+      var step = semis[(level - 1) % semis.length];
+      var f = 329.63 * Math.pow(2, step / 12);
+      var L = Math.max(2, Math.round(sr / f));
+
+      var ring = new Float32Array(L);
+      for (var i = 0; i < L; i++) ring[i] = Math.random() * 2 - 1;
+      for (var i = 1; i < L; i++) ring[i] = 0.65 * ring[i] + 0.35 * ring[i - 1];
+
+      var p = 0, decay = 0.9965;
+      for (var i = 0; i < n; i++) {
+        var x = ring[p];
+        var y = decay * 0.5 * (x + ring[(p + 1) % L]);
+        d[i] = y;
+        ring[p] = y;
+        p = (p + 1) % L;
+      }
+
+      var atk = Math.floor(sr * 0.004);
+      for (var i = 0; i < atk; i++) d[i] *= i / atk;
+      var fade = Math.floor(sr * 0.06);
+      for (var i = 0; i < fade; i++) d[n - 1 - i] *= i / fade;
+
+      var src = ac.createBufferSource();
+      src.buffer = buf;
+      var g = ac.createGain();
+      g.gain.value = 0.45;
+      src.connect(g);
+      g.connect(ac.destination);
+      src.start();
+    } catch (e) {}
+  }
+
+  /* ---------------- interaction ---------------- */
+
+  function elasticOut(t) {
+    if (t <= 0) return 0;
+    if (t >= 1) return 1;
+    return Math.pow(2, -10 * t) * Math.sin((t - 0.125) * (TAU / 0.5)) + 1;
+  }
+
+  function hitTest(x, y) {
+    var best = -1, bestD = Infinity;
+    var r = (NR + 16) * (NR + 16);
+    for (var i = 0; i < nodes.length; i++) {
+      var dx = x - nodes[i].x, dy = y - nodes[i].y;
+      var d = dx * dx + dy * dy;
+      if (d <= r && d < bestD) { bestD = d; best = i; }
+    }
+    return best;
+  }
+
+  function doSwap(a, b) {
+    var na = nodes[a], nb = nodes[b];
+    var sa = sockets[na.socket], sb = sockets[nb.socket];
+    var now = performance.now();
+    na.anim = { fx: na.x, fy: na.y, tx: sb.x, ty: sb.y, start: now };
+    nb.anim = { fx: nb.x, fy: nb.y, tx: sa.x, ty: sa.y, start: now };
+    var tmp = na.socket;
+    na.socket = nb.socket;
+    nb.socket = tmp;
+    selected = -1;
+    moves++;
+    updateHUD();
+  }
+
+  function onTap(x, y) {
+    ensureAudio();
+    if (state !== 'play' || anyAnim) return;
+    var i = hitTest(x, y);
+    if (i < 0) {
+      if (selected >= 0) selected = -1;
+      return;
+    }
+    if (selected < 0) selected = i;
+    else if (selected === i) selected = -1;
+    else doSwap(selected, i);
+  }
+
+  cv.addEventListener('touchstart', function (e) {
+    e.preventDefault();
+    if (e.touches.length) onTap(e.touches[0].clientX, e.touches[0].clientY);
+  }, { passive: false });
+  cv.addEventListener('touchmove', function (e) { e.preventDefault(); }, { passive: false });
+  cv.addEventListener('mousedown', function (e) { onTap(e.clientX, e.clientY); });
+  cv.addEventListener('contextmenu', function (e) { e.preventDefault(); });
+
+  restartEl.addEventListener('click', function () { ensureAudio(); restart(); });
+  window.addEventListener('resize', resize);
+  window.addEventListener('orientationchange', resize);
+
+  function updateHUD() {
+    levelEl.textContent = 'LEVEL ' + level;
+    movesEl.textContent = 'MOVES ' + moves;
+  }
+
+  /* ---------------- update ---------------- */
+
+  function startWin(now) {
+    state = 'win';
+    winStart = now;
+    selected = -1;
+    playPluck();
+  }
+
+  function update(now) {
+    anyAnim = false;
+    for (var i = 0; i < nodes.length; i++) {
+      var n = nodes[i];
+      if (n.anim) {
+        var t = (now - n.anim.start) / SWAP_MS;
+        if (t >= 1) {
+          n.x = n.anim.tx; n.y = n.anim.ty; n.anim = null;
+        } else {
+          var k = elasticOut(t);
+          n.x = n.anim.fx + (n.anim.tx - n.anim.fx) * k;
+          n.y = n.anim.fy + (n.anim.ty - n.anim.fy) * k;
+          anyAnim = true;
+        }
+      } else {
+        n.x = sockets[n.socket].x;
+        n.y = sockets[n.socket].y;
+      }
+    }
+
+    updateCrossings();
+    if (crossings > 0) tangled = true;
+
+    if (state === 'play') {
+      if (!anyAnim && crossings === 0 && tangled) startWin(now);
+    } else if (state === 'win') {
+      if (now - winStart >= WIN_MS) buildLevel(level + 1);
+    }
+  }
+
+  /* ---------------- render ---------------- */
+
+  function drawEdges() {
+    var lw = Math.max(1.1, Math.min(1.8, W / 300));
+    ctx.lineCap = 'round';
+    for (var i = 0; i < edges.length; i++) {
+      var e = edges[i];
+      var A = nodes[e.a], B = nodes[e.b];
+      var ax = A.x, ay = A.y, bx = B.x, by = B.y;
+      var set = CALM;
+      if (e.cross) {
+        set = HOT;
+        var j = 2.4; // high-frequency vibration
+        ax += (Math.random() - 0.5) * j;
+        ay += (Math.random() - 0.5) * j;
+        bx += (Math.random() - 0.5) * j;
+        by += (Math.random() - 0.5) * j;
+      }
+      for (var s = 0; s < set.length; s++) {
+        var st = set[s];
+        ctx.globalAlpha = st.a;
+        ctx.strokeStyle = st.c;
+        ctx.lineWidth = st.w * lw;
+        ctx.beginPath();
+        ctx.moveTo(ax, ay);
+        ctx.lineTo(bx, by);
+        ctx.stroke();
+      }
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function drawNodes(now) {
+    for (var i = 0; i < nodes.length; i++) {
+      var n = nodes[i];
+      var isSel = (i === selected);
+      var hot = n.hot;
+      var ring = isSel ? '#ffffff' : (hot ? '#ff5a1f' : '#5ce6ff');
+      var core = isSel ? '#ffffff' : (hot ? '#ffb08a' : '#d9fbff');
+
+      // glow halo
+      var g = ctx.createRadialGradient(n.x, n.y, NR * 0.4, n.x, n.y, NR * 2.3);
+      if (hot) g.addColorStop(0, 'rgba(255,90,31,0.30)');
+      else g.addColorStop(0, 'rgba(92,230,255,0.24)');
+      g.addColorStop(1, 'rgba(0,0,0,0)');
+      ctx.fillStyle = g;
+      ctx.beginPath();
+      ctx.arc(n.x, n.y, NR * 2.3, 0, TAU);
+      ctx.fill();
+
+      // body
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = isSel ? '#14243c' : '#0c1322';
+      ctx.beginPath();
+      ctx.arc(n.x, n.y, NR, 0, TAU);
+      ctx.fill();
+      ctx.strokeStyle = ring;
+      ctx.lineWidth = 2.1;
+      ctx.stroke();
+
+      ctx.fillStyle = core;
+      ctx.beginPath();
+      ctx.arc(n.x, n.y, NR * 0.38, 0, TAU);
+      ctx.fill();
+
+      if (isSel) { // highlight + pulse
+        var ph = 0.5 + 0.5 * Math.sin(now * 0.011);
+        ctx.strokeStyle = '#ffffff';
+        ctx.lineWidth = 2;
+        ctx.globalAlpha = 0.9;
+        ctx.beginPath();
+        ctx.arc(n.x, n.y, NR + 5 + ph * 7, 0, TAU);
+        ctx.stroke();
+        ctx.globalAlpha = 0.4 + 0.4 * ph;
+        ctx.fillStyle = '#ffffff';
+        ctx.beginPath();
+        ctx.arc(n.x, n.y, NR * (0.55 + 0.25 * ph), 0, TAU);
+        ctx.fill();
+        ctx.globalAlpha = 1;
+      }
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function drawWin(now) {
+    var k = Math.min(1, (now - winStart) / WIN_MS);
+    var e = k * k;
+    var sc = 1 - e;
+    var alpha = 1 - e;
+
+    // white flash
+    ctx.fillStyle = 'rgba(255,255,255,' + (0.24 * (1 - k)).toFixed(3) + ')';
+    ctx.fillRect(0, 0, W, H);
+
+    ctx.lineCap = 'round';
+    for (var i = 0; i < edges.length; i++) {
+      var A = nodes[edges[i].a], B = nodes[edges[i].b];
+      var ax = CX + (A.x - CX) * sc, ay = CY + (A.y - CY) * sc;
+      var bx = CX + (B.x - CX) * sc, by = CY + (B.y - CY) * sc;
+      ctx.strokeStyle = '#8fe8ff';
+      ctx.globalAlpha = alpha * 0.3;
+      ctx.lineWidth = 6;
+      ctx.beginPath(); ctx.moveTo(ax, ay); ctx.lineTo(bx, by); ctx.stroke();
+      ctx.strokeStyle = '#ffffff';
+      ctx.globalAlpha = alpha;
+      ctx.lineWidth = 2.4;
+      ctx.beginPath(); ctx.moveTo(ax, ay); ctx.lineTo(bx, by); ctx.stroke();
+    }
+
+    var r = Math.max(1, NR * (1 - 0.7 * e));
+    ctx.fillStyle = '#ffffff';
+    for (var i = 0; i < nodes.length; i++) {
+      var n = nodes[i];
+      ctx.globalAlpha = alpha;
+      ctx.beginPath();
+      ctx.arc(CX + (n.x - CX) * sc, CY + (n.y - CY) * sc, r, 0, TAU);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function draw(now) {
+    ctx.fillStyle = bgGrad || '#0a0e17';
+    ctx.fillRect(0, 0, W, H);
+    if (state === 'win') { drawWin(now); return; }
+    drawEdges();
+    drawNodes(now);
+  }
+
+  /* ---------------- loop ---------------- */
+
+  function frame(now) {
+    requestAnimationFrame(frame);
+    update(now);
+    draw(now);
+  }
+
+  resize();
+  buildLevel(1);
+  requestAnimationFrame(frame);
+
+  // tiny inspection hook for automated testing
+  window.__tension = {
+    snapshot: function () {
+      return {
+        level: level, moves: moves, state: state, crossings: crossings,
+        sockets: sockets.map(function (s) { return { x: s.x, y: s.y }; }),
+        nodes: nodes.map(function (n) { return { socket: n.socket, x: n.x, y: n.y }; })
+      };
+    }
+  };
+})();
+</script>
+</body>
+</html>
