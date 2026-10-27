@@ -428,6 +428,10 @@
   }
 
   function update(now) {
+    // self-heal: the script can run before the viewport has a size (sockets
+    // would collapse to a point) or the viewport can change without an event
+    if (W !== window.innerWidth || H !== window.innerHeight ||
+        DPR !== Math.min(window.devicePixelRatio || 1, 2)) resize();
     anyAnim = false;
     for (var i = 0; i < nodes.length; i++) {
       var n = nodes[i];
